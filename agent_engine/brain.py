@@ -1,7 +1,7 @@
 """
-brain.py - Stateless LLM Decision Engine
+brain.py - Stateless LLM Decision Engine (Phase 4: multi-step actions)
 Connects to a local Qwen 2.5 Coder 7B model via LM Studio and translates
-(user_command, ui_tree) into a strict JSON action for the actuator.
+(user_command, ui_tree) into a strict JSON array of sequential actions.
 """
 
 from __future__ import annotations
@@ -19,39 +19,49 @@ log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT: str = """\
 You are a precise desktop automation agent. Your job is to translate the user's \
-natural-language instruction into EXACTLY ONE action on the active window.
+natural-language instruction into a sequence of actions on the active window.
 
 ## RULES (STRICT)
 1. You can ONLY interact with the exact `id`s provided in the UI list below. \
 Do NOT invent, guess, or hallucinate element IDs that are not listed.
-2. If no element matches the user's intent, return action "none".
-3. Output ONLY a single JSON object. No markdown, no explanation, no commentary.
+2. If no element matches the user's intent, return a single-element array with action "none".
+3. Output ONLY a JSON array. No markdown, no explanation, no commentary.
+4. Each step in the sequence is one action object. Order matters — steps execute left to right.
 
-## ACTION SCHEMA (respond with EXACTLY this JSON structure)
-{
-  "thought":          "<Brief 1-sentence reasoning>",
-  "action":           "<'click' | 'type' | 'none'>",
-  "target_id":        <int id from UI list, or null if action is 'none'>,
-  "text_to_type":     "<string to type, or null if action is not 'type'>",
-  "requires_confirm": <true if action is destructive (delete, format, send, \
-pay, close unsaved work), false otherwise>
-}
+## SCHEMA (respond with EXACTLY this — a JSON array of action objects)
+[
+  {
+    "thought":          "<Brief 1-sentence reasoning for this step>",
+    "action":           "<'click' | 'type' | 'none'>",
+    "target_id":        <int id from UI list, or null if action is 'none'>,
+    "text_to_type":     "<string to type, or null if action is not 'type'>",
+    "requires_confirm": <true if this step is destructive (delete, format, send, pay, close unsaved work), false otherwise>
+  }
+]
+
+## EXAMPLES
+Instruction: "Click 9, then click multiply, then click 8"
+[
+  {"thought": "Click the 9 key.", "action": "click", "target_id": 5, "text_to_type": null, "requires_confirm": false},
+  {"thought": "Click multiply.", "action": "click", "target_id": 12, "text_to_type": null, "requires_confirm": false},
+  {"thought": "Click the 8 key.", "action": "click", "target_id": 4, "text_to_type": null, "requires_confirm": false}
+]
 
 ## SAFETY
-- Set "requires_confirm": true for ANY action that could cause data loss, \
-make a payment, send a message, or close unsaved work.
+- Set "requires_confirm": true ONLY for actions that cause irreversible data loss, make a payment, send a message, or close unsaved work (e.g. format, delete, submit order, send email).
+- Set "requires_confirm": false for: clicking Cancel, Dismiss, Close, Back, OK, navigation buttons, or any read-only action.
 - When unsure, default to "requires_confirm": true.
 """
 
-# ── Safe fallback ────────────────────────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
-SAFE_FALLBACK: dict[str, Any] = {
+SAFE_FALLBACK: list[dict[str, Any]] = [{
     "thought": "Could not determine a safe action.",
     "action": "none",
     "target_id": None,
     "text_to_type": None,
     "requires_confirm": False,
-}
+}]
 
 REQUIRED_KEYS: set[str] = {"thought", "action", "target_id", "text_to_type", "requires_confirm"}
 VALID_ACTIONS: set[str] = {"click", "type", "none"}
@@ -63,62 +73,85 @@ def _build_ui_block(ui_elements: list[dict[str, Any]]) -> str:
     """Render the UI element list into a compact text block for the prompt."""
     if not ui_elements:
         return "(No interactive elements detected)"
-    lines: list[str] = []
-    for el in ui_elements:
-        eid = el.get("id", "?")
-        name = el.get("name", "")
-        ctype = el.get("control_type", "Unknown")
-        cx = el.get("center_x", 0)
-        cy = el.get("center_y", 0)
-        lines.append(f'[{eid}] {ctype}: "{name}" @ ({cx}, {cy})')
-    return "\n".join(lines)
+    return "\n".join(
+        f'[{el.get("id", "?")}] {el.get("control_type", "Unknown")}: '
+        f'"{el.get("name", "")}" @ ({el.get("center_x", 0)}, {el.get("center_y", 0)})'
+        for el in ui_elements
+    )
 
 
-def _extract_json(raw: str) -> dict[str, Any]:
+def _extract_action_list(raw: str) -> list[dict[str, Any]]:
     """
-    Forcefully extract a JSON dict from the LLM's raw text output.
+    Forcefully extract a JSON array from the LLM's raw text output.
 
-    Local models often wrap JSON in markdown fences (```json ... ```)
-    or add conversational padding. This strips all of that.
+    Handles local model hallucinations:
+    - Markdown fences (```json ... ```)
+    - Conversational padding around the array
+    - Single dict instead of array (auto-wrapped for backwards compat)
     """
-    # Try to find the outermost { ... } block
+    # Try array first (primary format)
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        result = json.loads(match.group())
+        if isinstance(result, list):
+            return result
+
+    # Fallback: model returned a single dict — wrap it
     match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in LLM output")
-    return json.loads(match.group())
+    if match:
+        result = json.loads(match.group())
+        if isinstance(result, dict):
+            log.warning("LLM returned a single dict instead of an array — wrapping it")
+            return [result]
+
+    raise ValueError("No JSON array or object found in LLM output")
 
 
-def _validate_action(parsed: dict[str, Any], valid_ids: set[int]) -> dict[str, Any]:
+def _validate_step(step: dict[str, Any], valid_ids: set[int]) -> dict[str, Any] | None:
     """
-    Validates the parsed action dict against the schema and the available UI IDs.
-    Returns the dict if valid, otherwise returns SAFE_FALLBACK.
+    Validates a single action step. Returns the (possibly coerced) step dict,
+    or None if the step is fatally invalid and should be replaced by a fallback.
     """
-    # Check all required keys are present
-    if not REQUIRED_KEYS.issubset(parsed.keys()):
-        log.warning("Action missing required keys: %s", REQUIRED_KEYS - parsed.keys())
-        return dict(SAFE_FALLBACK)
+    if not REQUIRED_KEYS.issubset(step.keys()):
+        log.warning("Step missing required keys: %s", REQUIRED_KEYS - step.keys())
+        return None
 
-    # Validate action field
-    action = parsed.get("action")
+    action = step.get("action")
     if action not in VALID_ACTIONS:
-        log.warning("Invalid action '%s', falling back to 'none'", action)
-        return dict(SAFE_FALLBACK)
+        log.warning("Invalid action '%s' in step", action)
+        return None
 
-    # Validate target_id references a real element
-    target_id = parsed.get("target_id")
+    target_id = step.get("target_id")
     if action in ("click", "type") and target_id not in valid_ids:
-        log.warning("target_id %s not in UI element list, falling back", target_id)
-        return dict(SAFE_FALLBACK)
+        log.warning("target_id %s not in UI element list", target_id)
+        return None
 
-    # Validate type action has text
-    if action == "type" and not parsed.get("text_to_type"):
-        log.warning("action='type' but text_to_type is empty, falling back")
-        return dict(SAFE_FALLBACK)
+    if action == "type" and not step.get("text_to_type"):
+        log.warning("action='type' but text_to_type is empty")
+        return None
 
-    # Ensure boolean for requires_confirm
-    parsed["requires_confirm"] = bool(parsed.get("requires_confirm", False))
+    step["requires_confirm"] = bool(step.get("requires_confirm", False))
+    return step
 
-    return parsed
+
+def _validate_action_list(
+    steps: list[dict[str, Any]],
+    valid_ids: set[int],
+) -> list[dict[str, Any]]:
+    """
+    Validates every step in the action list.
+    Invalid steps are replaced with a safe 'none' action so execution
+    can still proceed for the remaining valid steps.
+    """
+    validated: list[dict[str, Any]] = []
+    for i, step in enumerate(steps):
+        result = _validate_step(step, valid_ids)
+        if result is not None:
+            validated.append(result)
+        else:
+            log.warning("Step %d failed validation — substituting safe 'none'", i)
+            validated.append(dict(SAFE_FALLBACK[0]))
+    return validated if validated else list(SAFE_FALLBACK)
 
 
 # ── AgentBrain ───────────────────────────────────────────────────────────────
@@ -126,7 +159,7 @@ def _validate_action(parsed: dict[str, Any], valid_ids: set[int]) -> dict[str, A
 class AgentBrain:
     """
     Stateless decision engine. Sends (user_command + UI context) to a local
-    LLM and returns a validated action dict.
+    LLM and returns a validated list of sequential action dicts.
     """
 
     def __init__(
@@ -135,7 +168,7 @@ class AgentBrain:
         api_key: str = "lm-studio",
         model: str = "qwen2.5-coder-7b-instruct",
         temperature: float = 0.1,
-        max_tokens: int = 300,
+        max_tokens: int = 600,  # Increased for multi-step responses
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -147,18 +180,19 @@ class AgentBrain:
         self,
         user_prompt: str,
         ui_elements: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         """
         Sends the user's command and UI context to the local LLM,
-        parses the JSON response, validates it, and returns a safe action dict.
+        parses the JSON array response, validates each step, and returns
+        a safe sequential action list.
 
         Args:
-            user_prompt:  Natural-language instruction from the user.
+            user_prompt:  Natural-language instruction (may describe multiple steps).
             ui_elements:  List of dicts with keys: id, name, control_type,
                           center_x, center_y.
 
         Returns:
-            Validated action dict conforming to the action schema.
+            Validated list of action dicts. Always returns at least one step.
         """
         ui_block = _build_ui_block(ui_elements)
         valid_ids: set[int] = {el["id"] for el in ui_elements if "id" in el}
@@ -183,16 +217,16 @@ class AgentBrain:
 
         except ConnectionError as exc:
             log.error("LM Studio connection failed: %s", exc)
-            return dict(SAFE_FALLBACK)
+            return list(SAFE_FALLBACK)
         except Exception as exc:
             log.error("LLM request failed: %s", exc)
-            return dict(SAFE_FALLBACK)
+            return list(SAFE_FALLBACK)
 
         # ── Parse & validate ─────────────────────────────────────────────
         try:
-            parsed = _extract_json(raw_output)
+            steps = _extract_action_list(raw_output)
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning("JSON extraction failed: %s — raw: %s", exc, raw_output[:200])
-            return dict(SAFE_FALLBACK)
+            return list(SAFE_FALLBACK)
 
-        return _validate_action(parsed, valid_ids)
+        return _validate_action_list(steps, valid_ids)
