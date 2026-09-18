@@ -51,6 +51,11 @@ Instruction: "Click 9, then click multiply, then click 8"
 - Set "requires_confirm": true ONLY for actions that cause irreversible data loss, make a payment, send a message, or close unsaved work (e.g. format, delete, submit order, send email).
 - Set "requires_confirm": false for: clicking Cancel, Dismiss, Close, Back, OK, navigation buttons, or any read-only action.
 - When unsure, default to "requires_confirm": true.
+
+CRITICAL RULES FOR TARGET_ID:
+1. You MUST match the EXACT name or number from the UI list. Do not guess IDs or pick random elements.
+2. If the user asks for a number (e.g., "9"), find the element named "Nine", "9", or "Dokuz".
+3. If you cannot find a matching element with 100% certainty, set action to "none". Do NOT click random elements to satisfy the sequence.
 """
 
 # ── Constants ────────────────────────────────────────────────────────────────
