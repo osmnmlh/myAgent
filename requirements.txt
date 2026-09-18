@@ -1,0 +1,10 @@
+# agent_engine – Phase 1 dependencies
+# All Win32 interaction is via ctypes (stdlib).
+# No third-party packages are strictly required.
+# The entries below are optional quality-of-life additions:
+
+# Type checking (dev only)
+mypy>=1.9
+
+# If you ever want pynput as a fallback hook backend:
+# pynput>=1.7
