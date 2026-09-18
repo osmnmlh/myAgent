@@ -1,10 +1,8 @@
-# agent_engine – Phase 1 dependencies
-# All Win32 interaction is via ctypes (stdlib).
-# No third-party packages are strictly required.
-# The entries below are optional quality-of-life additions:
+# agent_engine – Phase 1 & 2 dependencies
+# Core Win32 interaction for Phase 1 uses ctypes (stdlib).
+# Phase 2 UI element detection requires uiautomation:
+
+uiautomation>=2.0.29
 
 # Type checking (dev only)
 mypy>=1.9
-
-# If you ever want pynput as a fallback hook backend:
-# pynput>=1.7
