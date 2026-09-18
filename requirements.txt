@@ -1,8 +1,11 @@
-# agent_engine – Phase 1 & 2 dependencies
+# agent_engine – Phase 1, 2 & 3 dependencies
 # Core Win32 interaction for Phase 1 uses ctypes (stdlib).
-# Phase 2 UI element detection requires uiautomation:
 
+# Phase 2: UI element detection
 uiautomation>=2.0.29
+
+# Phase 3: LLM decision engine (LM Studio client)
+openai>=1.0
 
 # Type checking (dev only)
 mypy>=1.9

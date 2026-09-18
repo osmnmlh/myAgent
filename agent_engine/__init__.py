@@ -5,19 +5,22 @@ Core low-level safety and execution engine for the local AI desktop assistant.
 
 Public surface
 --------------
-  AgentState   – thread-safe state enum
+  AgentState    – thread-safe state enum
   SafetyMonitor – low-level hook monitor + kill-switch
   Actuator      – instant mouse / keyboard actuator
   StatusOverlay – click-through border overlay
+  AgentBrain    – stateless LLM decision engine
 """
 
 from .safety import AgentState, SafetyMonitor
 from .actuator import Actuator
 from .overlay import StatusOverlay
+from .brain import AgentBrain
 
 __all__ = [
     "AgentState",
     "SafetyMonitor",
     "Actuator",
     "StatusOverlay",
+    "AgentBrain",
 ]
