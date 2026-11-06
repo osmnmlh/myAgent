@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Code Quality & Syntax Check
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax & Compilation check
+        run: |
+          python -m py_compile main.py ui_detector.py live_integration_test.py
+          python -m py_compile agent_engine/*.py
+
+      - name: Run offline diagnostic tests
+        run: |
+          python -c "import agent_engine; print('agent_engine package loaded successfully')"
